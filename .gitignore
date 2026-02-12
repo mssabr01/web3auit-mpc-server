@@ -1,0 +1,33 @@
+# Secrets & environment
+.env
+.env.*
+*.key
+*.pem
+*.p12
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Node (Aderyn npm)
+node_modules/
+
+# Solidity build artifacts
+out/
+cache/
+artifacts/
+typechain/
+typechain-types/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

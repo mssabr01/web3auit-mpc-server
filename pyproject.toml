@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "web3audit-mcp"
+version = "0.1.0"
+description = "MCP server for smart contract auditing — orchestrates Slither, Aderyn, and custom detectors"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pydantic>=2.0",
+    "thefuzz[speedup]>=0.22",
+]
+
+[project.scripts]
+web3audit-mcp = "web3audit_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/web3audit_mcp"]
