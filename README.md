@@ -1,2 +1,2 @@
-# web3auit-mpc-server
-MPC server for web3 audits
+# web3auit-mcp-server
+MCP server for web3 audits
