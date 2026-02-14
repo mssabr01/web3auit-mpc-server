@@ -2,12 +2,24 @@
 
 Exposes the following MCP tools:
 
-  audit            Full pipeline: run tools → dedup → report
-  run_slither      Run only Slither
-  run_aderyn       Run only Aderyn
-  run_custom       Run only custom DeFi detectors
-  list_detectors   List registered custom detectors
-  generate_report  Re-render the last audit result as Markdown
+  Audit pipeline
+  ──────────────
+  audit              Full pipeline: run tools → dedup → report
+  run_slither        Run only Slither
+  run_aderyn         Run only Aderyn
+  run_custom         Run only custom DeFi detectors
+  list_detectors     List registered custom detectors
+  regenerate_report  Re-render the last audit result as Markdown
+  get_audit_json     Raw JSON of last audit
+
+  PoC / validation
+  ────────────────
+  generate_poc       Generate a Forge test PoC for one finding
+  run_forge_test     Run forge tests in any project
+  validate_finding   End-to-end: generate → compile → test → report
+  run_forge_coverage Run forge coverage
+  list_poc_strategies List available PoC strategies
+  read_contract_source Read a Solidity file (for agent inspection)
 """
 
 from __future__ import annotations
@@ -15,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -22,10 +35,16 @@ from mcp.server.fastmcp import FastMCP
 from .dedup import deduplicate
 from .detectors import DetectorRegistry
 from .detectors.registry import get_registry
+from .forge.runner import ForgeRunner
 from .models import AuditConfig, AuditResult, Finding, Severity, SourceTool
+from .poc.generator import PoCGenerator
+from .poc.models import PoCArtifact, PoEResult
+from .poc.project_manager import ForgeProjectManager
+from .poc.strategies import build_default_registry
 from .report import generate_report
 from .runners.aderyn import AderynRunner
 from .runners.slither import SlitherRunner
+from . import source_reader
 
 # Force detector registration (side-effect imports)
 import web3audit_mcp.detectors.flash_loan  # noqa: F401
@@ -43,16 +62,21 @@ mcp = FastMCP(
     "web3audit-mcp",
     instructions=(
         "Smart-contract auditing server: orchestrates Slither, Aderyn, and "
-        "custom DeFi detectors with cross-tool deduplication and structured reports."
+        "custom DeFi detectors with cross-tool deduplication and structured reports. "
+        "Also generates and runs Forge-based PoC tests to prove findings exploitable."
     ),
 )
 
-# Shared state (last audit result, for report regeneration)
+# Shared state
 _last_result: AuditResult | None = None
+_last_pocs: dict[str, PoCArtifact] = {}  # finding_id → PoCArtifact
 
-# Runner singletons
+# Singletons
 _slither = SlitherRunner()
 _aderyn = AderynRunner()
+_forge = ForgeRunner()
+_poc_gen = PoCGenerator(build_default_registry())
+_project_mgr = ForgeProjectManager()
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +317,245 @@ async def get_audit_json() -> str:
     if _last_result is None:
         return json.dumps({"error": "No audit result cached. Run `audit` first."})
     return _last_result.model_dump_json(indent=2, exclude={"findings": {"__all__": {"raw"}}})
+
+
+# ---------------------------------------------------------------------------
+# PoC / Forge Tools
+# ---------------------------------------------------------------------------
+
+def _find_by_id(finding_id: str) -> Finding | None:
+    """Look up a finding from the last audit result."""
+    if _last_result is None:
+        return None
+    for f in _last_result.findings:
+        if f.id == finding_id:
+            return f
+    return None
+
+
+@mcp.tool()
+async def generate_poc(
+    finding_id: str,
+    project_path: str = "/contracts",
+    solc_version: str = "0.8.24",
+    strategy: str | None = None,
+) -> str:
+    """Generate a Proof-of-Concept Forge test for an audit finding.
+
+    Args:
+        finding_id: ID of the finding (from the last audit run).
+        project_path: Path to the Solidity project root.
+        solc_version: Solidity compiler version for the test.
+        strategy: Force a specific strategy name (auto-detect if omitted).
+
+    Returns:
+        JSON with the PoCArtifact including the generated Solidity test source.
+    """
+    finding = _find_by_id(finding_id)
+    if finding is None:
+        return json.dumps({"error": f"Finding {finding_id!r} not found. Run `audit` first."})
+
+    poc = _poc_gen.generate_for_finding(
+        finding, Path(project_path), solc_version, strategy,
+    )
+    if poc is None:
+        return json.dumps({"error": f"No applicable PoC strategy for detector {finding.detector!r}."})
+
+    _last_pocs[finding_id] = poc
+    return poc.model_dump_json(indent=2)
+
+
+@mcp.tool()
+async def run_forge_test(
+    project_path: str,
+    test_filter: str | None = None,
+    fork_url: str | None = None,
+    fork_block: int | None = None,
+    verbosity: int = 2,
+    timeout: int = 300,
+) -> str:
+    """Run ``forge test`` in a project and return structured results.
+
+    This is a general-purpose Forge test runner — works on any Forge project,
+    not just generated PoCs.
+
+    Args:
+        project_path: Path to the Forge project root.
+        test_filter: Regex to filter test names (e.g. "test_reentrancy").
+        fork_url: RPC URL to fork mainnet (enables fork-based testing).
+        fork_block: Block number to fork at (latest if omitted).
+        verbosity: 0-5 (more = more trace output).
+        timeout: Timeout in seconds.
+
+    Returns:
+        JSON array of ForgeTestResult objects.
+    """
+    results = await _forge.test(
+        Path(project_path),
+        test_filter=test_filter,
+        fork_url=fork_url,
+        fork_block=fork_block,
+        verbosity=verbosity,
+        timeout=timeout,
+    )
+    return json.dumps([r.model_dump() for r in results], indent=2)
+
+
+@mcp.tool()
+async def validate_finding(
+    finding_id: str,
+    project_path: str = "/contracts",
+    solc_version: str = "0.8.24",
+    strategy: str | None = None,
+    fork_url: str | None = None,
+    fork_block: int | None = None,
+    cleanup: bool = False,
+) -> str:
+    """End-to-end: generate PoC → compile → run test → report exploitability.
+
+    This is the high-level tool an agent uses to prove a finding is real.
+
+    Args:
+        finding_id: ID of the finding to validate.
+        project_path: Path to the Solidity project root.
+        solc_version: Solidity compiler version.
+        strategy: Force a PoC strategy (auto-detect if omitted).
+        fork_url: Optional RPC URL for mainnet-fork testing.
+        fork_block: Block number to fork at.
+        cleanup: Delete the temporary Forge project after testing.
+
+    Returns:
+        JSON PoEResult with compile output, test results, and proven_exploitable flag.
+    """
+    finding = _find_by_id(finding_id)
+    if finding is None:
+        return json.dumps({"error": f"Finding {finding_id!r} not found. Run `audit` first."})
+
+    # 1. Generate PoC
+    poc = _last_pocs.get(finding_id) or _poc_gen.generate_for_finding(
+        finding, Path(project_path), solc_version, strategy,
+    )
+    if poc is None:
+        return PoEResult(
+            finding_id=finding_id,
+            finding_title=finding.title,
+            poc=PoCArtifact(
+                finding_id=finding_id, finding_title=finding.title,
+                detector=finding.detector, strategy="none",
+                test_contract_name="", test_function_name="",
+                test_file_path="", solidity_code="",
+            ),
+            overall_status="error",
+            error_message=f"No PoC strategy for {finding.detector}",
+        ).model_dump_json(indent=2)
+
+    _last_pocs[finding_id] = poc
+
+    # 2. Create isolated Forge project
+    forge_dir = _project_mgr.create_project(
+        [poc], Path(project_path), solc_version,
+    )
+
+    # 3. Compile
+    compile_result = await _forge.compile(forge_dir, solc_version)
+    if not compile_result.success:
+        return PoEResult(
+            finding_id=finding_id,
+            finding_title=finding.title,
+            poc=poc,
+            compile_result=compile_result,
+            overall_status="compile_failed",
+            error_message=compile_result.stderr[:2000],
+            forge_project_path=str(forge_dir),
+        ).model_dump_json(indent=2)
+
+    # 4. Run tests
+    test_results = await _forge.test(
+        forge_dir,
+        test_filter=poc.test_function_name,
+        fork_url=fork_url,
+        fork_block=fork_block,
+    )
+
+    any_passed = any(t.passed for t in test_results)
+    all_passed = all(t.passed for t in test_results) and len(test_results) > 0
+
+    result = PoEResult(
+        finding_id=finding_id,
+        finding_title=finding.title,
+        poc=poc,
+        compile_result=compile_result,
+        test_results=test_results,
+        proven_exploitable=any_passed,
+        overall_status="success" if all_passed else "test_failed",
+        forge_project_path=str(forge_dir),
+    )
+
+    # 5. Cleanup if requested
+    if cleanup:
+        _project_mgr.cleanup(forge_dir)
+
+    return result.model_dump_json(indent=2)
+
+
+@mcp.tool()
+async def run_forge_coverage(
+    project_path: str = "/contracts",
+    timeout: int = 300,
+) -> str:
+    """Run ``forge coverage`` and return per-file coverage statistics.
+
+    Args:
+        project_path: Path to a Forge project root.
+        timeout: Timeout in seconds.
+
+    Returns:
+        JSON array of coverage entries with line/branch/function stats.
+    """
+    entries = await _forge.coverage(Path(project_path), timeout=timeout)
+    return json.dumps([e.model_dump() for e in entries], indent=2)
+
+
+@mcp.tool()
+async def list_poc_strategies() -> str:
+    """List all available PoC generation strategies with their applicable detectors."""
+    strategies = _poc_gen.strategies.all
+    out = []
+    for s in strategies:
+        out.append({
+            "name": s.name,
+            "difficulty": s.difficulty,
+            "applicable_detectors": sorted(s.applicable_detectors),
+        })
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
+async def read_contract_source(
+    project_path: str = "/contracts",
+    file_path: str = "",
+) -> str:
+    """Read a Solidity source file from the project.
+
+    Useful for an agent to inspect contract interfaces before writing PoCs.
+
+    Args:
+        project_path: Project root.
+        file_path: Relative path to the .sol file (e.g. "src/Token.sol").
+                   If empty, lists all .sol files in the project.
+
+    Returns:
+        The file contents, or a JSON list of available .sol files.
+    """
+    root = Path(project_path)
+    if not file_path:
+        files = source_reader.list_solidity_files(root)
+        return json.dumps(files, indent=2)
+
+    content = source_reader.read_file(root, file_path)
+    if content is None:
+        return json.dumps({"error": f"File not found: {file_path}"})
+    return content
 
 
 # ---------------------------------------------------------------------------

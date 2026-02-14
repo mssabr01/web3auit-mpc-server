@@ -9,11 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # ---- Foundry (forge, cast, anvil) -----------------------------------------
-ENV FOUNDRY_VERSION=nightly-de33b6af53005037b463318d2628b5cfcaf39916
 RUN curl -L https://foundry.paradigm.xyz | bash && \
-    bash -c "source /root/.bashrc && foundryup --version ${FOUNDRY_VERSION}" || \
     /root/.foundry/bin/foundryup
 ENV PATH="/root/.foundry/bin:${PATH}"
+# Verify Foundry installation
+RUN forge --version && cast --version && anvil --version
 
 # ---- uv (fast Python package manager) -------------------------------------
 RUN pip install --no-cache-dir uv
@@ -49,6 +49,11 @@ RUN uv pip install --system slither-analyzer
 # ---- Aderyn (Cyfrin's Rust-based static analyser) --------------------------
 # Official npm package — no Rust toolchain or shell reload required
 RUN npm install -g @cyfrin/aderyn
+
+# ---- forge-std (cached for PoC test projects) -----------------------------
+RUN mkdir -p /opt/forge-std-cache/lib && \
+    git clone --depth 1 https://github.com/foundry-rs/forge-std.git \
+        /opt/forge-std-cache/lib/forge-std
 
 # ---- web3audit-mcp (this project) -----------------------------------------
 COPY pyproject.toml README.md /app/

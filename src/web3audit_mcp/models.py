@@ -47,6 +47,7 @@ class SourceTool(str, Enum):
     SLITHER = "slither"
     ADERYN = "aderyn"
     CUSTOM = "custom"
+    POC = "poc"
 
 
 # ---------------------------------------------------------------------------
